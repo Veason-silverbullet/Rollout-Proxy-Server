@@ -1,0 +1,18 @@
+inference_engine: sglang
+transport_mode: verl
+
+
+host: 0.0.0.0
+port: 9400
+proxy_api_delimiter: "-"
+save_rollout_sessions: true
+rollout_session_dir: sessions
+save_rollout_logprobs: true
+log_dir: logs
+
+
+# Training-side sampling policy that WINS OVER agent-request params
+# (distribution keys only -- temperature, top_p, top_k, min_p, *_penalty;
+# max_tokens/stop stay request-owned), e.g.:
+# sampling_overrides:
+#   temperature: 1.0

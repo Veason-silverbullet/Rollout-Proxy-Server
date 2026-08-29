@@ -1,0 +1,47 @@
+inference_engine: sglang
+transport_mode: slime
+
+
+host: 0.0.0.0
+port: 9400
+proxy_api_delimiter: "-"
+save_rollout_sessions: true
+rollout_session_dir: sessions
+save_rollout_logprobs: true
+log_dir: logs
+
+
+# transport_mode: slime — the proxy generates through slime's
+# sgl-router itself, so `python -m proxyserver.cli` serves agents
+#   router_url:      base URL of slime's sgl-router, http://{sglang_router_ip}:{sglang_router_port}
+#   router_api_key:  optional bearer token for the router
+#   context_length:  the engines' context window in tokens
+# The model is not configured: agents name it in each request's `model` field
+# and the proxy maps it to a tokenizer and tool-call parser via tokenization/mapping.json.
+router_url: null
+router_api_key: null
+# The window the proxy clamps each turn's max_tokens to: set it to whatever the
+# engines were launched with — SGLang's `--context-length`, i.e. slime's
+# `--sglang-context-length` (slime's own `--rollout-max-context-len` should match).
+context_length: 262144
+
+
+# R3 (slime's --use-rollout-routing-replay): ask the engines for the per-token
+# MoE expert selections on every /generate and record the latest capture per
+# agent stream (uint8-packed; each turn covers the whole stream so far and
+# supersedes the previous).  Requires engines launched with
+# enable_return_routed_experts — slime sets that server arg from the same flag,
+# so keep the two in step: flag on with capture off crashes the trainer's first
+# step, capture on against engines without the server arg fails the first turn.
+return_routed_experts: false
+save_rollout_routed_experts: false
+
+
+# Training-side sampling policy that WINS OVER agent-request params — the restart-proof baseline for RL rollouts.
+# Distribution keys only (temperature, top_p, top_k, min_p, *_penalty); max_tokens/stop stay request-owned.
+# The trainer may push a runtime layer over this one via PUT /sampling_overrides (bare PROXY_API_KEY bearer), re-verified each step.
+# Full precedence:
+#   runtime push > sampling_overrides > request > generation_config.json
+# sampling_overrides:
+#   temperature: 1.0
+#   top_p: 1.0

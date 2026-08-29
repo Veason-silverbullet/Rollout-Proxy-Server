@@ -1,0 +1,11 @@
+{
+    "rl-exp-model": "qwen3_5",
+    "Qwen3.5-4B": "qwen3_5",
+    "Qwen3.5-9B-Base": "qwen3_5",
+    "Qwen3.5-9B": "qwen3_5",
+    "Qwen3.5-27B": "qwen3_5",
+    "Qwen3.5-35B-A3B-Base": "qwen3_5",
+    "Qwen3.5-35B-A3B": "qwen3_5",
+    "Llama-3.1-8B-Instruct": "llama3_1",
+    "Llama-3.1-70B-Instruct": "llama3_1"
+}
