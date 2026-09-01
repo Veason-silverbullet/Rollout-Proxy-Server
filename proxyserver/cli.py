@@ -220,6 +220,7 @@ def run_standalone_proxy(
         set_sampling_overrides=provider.set_runtime_sampling_overrides if provider is not None else None,
         get_routed_experts_config=get_routed_experts_config,
         set_routed_experts_config=set_routed_experts_config,
+        get_tokenizer_fingerprint=provider.tokenizer_fingerprint if provider is not None else None,
         save_rollout_routed_experts=cfg.save_rollout_routed_experts if cfg is not None else False,
         mode_label=mode_label,
     )

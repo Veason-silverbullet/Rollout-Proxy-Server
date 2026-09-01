@@ -243,6 +243,28 @@ def _build_app(proxy: "LLMProxyServer") -> FastAPI:
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    # ---- tokenizer identity ----------------------------------------------
+    # Training–rollout consistency: the trainer compares the serving
+    # tokenizer's fingerprint against its --hf-checkpoint's before any trial
+    # runs (harbor.slime_bridge.rollout._sync_tokenizer_identity).  Local
+    # mode only: the provider owns the tokenizers; relay mode tokenizes on
+    # the workers, so the endpoint answers 501 there.
+
+    @app.get("/tokenizer_fingerprint")
+    async def get_tokenizer_fingerprint(model: str):
+        """Identity fingerprint of the tokenizer serving ``model``.
+
+        Open like ``GET /sampling_overrides`` — it reveals only hashes.
+        Computed on the runtime tokenizer and cached per profile; the first
+        call hashes the full vocab, so it runs off the event loop.
+        """
+        if proxy._get_tokenizer_fingerprint is None:
+            raise HTTPException(status_code=501, detail="Tokenizer fingerprint requires local mode (no provider on this process)")
+        try:
+            return await asyncio.to_thread(proxy._get_tokenizer_fingerprint, model)
+        except UnknownModelError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
     # ---- session management ----------------------------------------------
     # Sessions are opened lazily by the first keyed completion request;
     # these endpoints let the rollout driver fetch, complete, and delete
@@ -851,6 +873,7 @@ class LLMProxyServer:
         set_sampling_overrides: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         get_routed_experts_config: Callable[[], dict[str, Any]] | None = None,
         set_routed_experts_config: Callable[[bool | None], dict[str, Any]] | None = None,
+        get_tokenizer_fingerprint: Callable[[str], dict[str, Any]] | None = None,
         api_key: str | None = None,
         error_log_dir: str | Path | None = None,
         save_rollout_sessions: bool = True,
@@ -936,6 +959,12 @@ class LLMProxyServer:
                 ``PUT /routed_experts`` (local slime mode passes the
                 provider's ``set_runtime_routed_experts``); may raise
                 ``ValueError``, surfaced as HTTP 400.
+            get_tokenizer_fingerprint: Optional callable backing
+                ``GET /tokenizer_fingerprint`` (local mode passes the
+                provider's ``tokenizer_fingerprint``).  Without it the
+                endpoint answers 501 — relay mode tokenizes on the workers,
+                not on this process.  May raise ``UnknownModelError``,
+                surfaced as HTTP 404.
             mode_label: Directory label for logs/session records under their
                 roots.  Defaults to ``relay`` (relay mode) / ``local``
                 (local mode); local-mode hosts usually name their transport
@@ -948,6 +977,7 @@ class LLMProxyServer:
         self._set_sampling_overrides = set_sampling_overrides
         self._get_routed_experts_config = get_routed_experts_config
         self._set_routed_experts_config = set_routed_experts_config
+        self._get_tokenizer_fingerprint = get_tokenizer_fingerprint
         self.key_delimiter = key_delimiter or PROXY_KEY_DELIMITER
         self._api_key = api_key
 

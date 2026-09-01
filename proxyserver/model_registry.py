@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 from .token_stream import TokenStreamManager
+from .tokenization import fingerprint as _fingerprint
 from .tokenization.base import ModelProfile, get_profile
 from .tokenization.tool_parser import NullToolParser, get_tool_parser
 
@@ -360,6 +361,9 @@ class ModelRegistry:
             from transformers import AutoTokenizer  # noqa: F401
         #: Keyed by profile name; every model name of a profile shares one bundle.
         self._bundles: dict[str, ResolvedModel] = {}
+        #: Tokenizer-identity fingerprints, keyed by profile name (computing
+        #: one hashes the full vocab — cheap, but not per-request cheap).
+        self._fingerprints: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
     def resolve(self, model_name: str) -> ResolvedModel:
@@ -402,6 +406,33 @@ class ModelRegistry:
                 profile.generation_prompt, profile.assistant_turn_end, model_name,
             )
             return bundle
+
+    def fingerprint_payload(self, model_name: str) -> dict[str, Any]:
+        """The tokenizer-identity fingerprint of the profile serving
+        ``model_name`` (see :mod:`proxyserver.tokenization.fingerprint`),
+        computed on the *runtime* tokenizer — the exact object every
+        ``apply_chat_template``/``encode`` of this profile's sessions runs on
+        — and cached per profile.
+
+        Backs ``GET /tokenizer_fingerprint``; the trainer compares the
+        ``fingerprint`` field against its ``--hf-checkpoint``'s and the
+        ``template_pin`` against an operator-pinned hash before any trial runs.
+        """
+        profile = resolve_profile(model_name)
+        with self._lock:
+            cached = self._fingerprints.get(profile.name)
+        if cached is None:
+            bundle = self.resolve(model_name)
+            payload = _fingerprint.tokenizer_fingerprint(bundle.tokenizer)
+            payload["profile"] = profile.name
+            payload["generation_prompt"] = profile.generation_prompt
+            payload["assistant_turn_end"] = profile.assistant_turn_end
+            payload["template_pin"] = _fingerprint.template_pin(
+                payload["template_sha256"], profile.generation_prompt, profile.assistant_turn_end
+            )
+            with self._lock:
+                cached = self._fingerprints.setdefault(profile.name, payload)
+        return {"model": str(model_name), **cached}
 
     def drop_session(self, session_id: str) -> None:
         """Forget a session's token stream in every loaded bundle."""

@@ -4,38 +4,50 @@
 #   1. byte-compile every source and test file
 #   2. test-engines.py        (offline: adapters, providers, slime + direct
 #                              transports, lost-response retry re-serve)
-#   3. test-token-stream.py   (offline: strict-TITO manager, every tokenizer
+#   3. test-sglang-transport.py (offline: the slime transport — sampled
+#                              ids from output_ids with the logprob-triple
+#                              fallback, misaligned payloads refused, the
+#                              X-SMG-Routing-Key header, weight_version,
+#                              and the context-window clamp incl. the
+#                              sgl-router RouterManager stub payload)
+#   4. test-token-stream.py   (offline: strict-TITO manager, every tokenizer
 #                              return shape; bundled Qwen3.5 templates + the
 #                              real $TOKENIZER_MODEL tokenizer, each skipped
 #                              if transformers or the tokenizer is missing)
-#   4. test-profiles.py       (offline: per-model profiles — stated chat
+#   5. test-profiles.py       (offline: per-model profiles — stated chat
 #                              markers, tool-call parser, reasoning format;
 #                              built streams match the template's own render)
-#   5. test-recorder.py       (offline: delta storage + duplicate-delivery
+#   6. test-recorder.py       (offline: delta storage + duplicate-delivery
 #                              dedup + routed-experts superseding and
 #                              snapshot gating)
-#   6. test-routed-experts.py (offline: R3 capture — int32 -> uint8 repack
+#   7. test-routed-experts.py (offline: R3 capture — int32 -> uint8 repack
 #                              + refusals, the /generate request flag, the
 #                              provider's config/runtime capture layers)
-#   7. test-relay-recovery.py (offline e2e: real proxy + real worker client
+#   8. test-relay-recovery.py (offline e2e: real proxy + real worker client
 #                              + local mode, scripted engine — relay-timeout
 #                              orphan recording, retry re-serve (also racing
 #                              a still-generating original), worker-disconnect
 #                              buffering, local-mode disconnect shielding)
-#   8. test-multi-agent.py    (offline e2e: multi-agent rollouts — keyed
+#   9. test-multi-agent.py    (offline e2e: multi-agent rollouts — keyed
 #                              api_keys with agent_id, one TITO stream per
 #                              agent, concurrent agents, per-agent record
 #                              tagging, delete releasing every stream)
-#   9. test-tool-parser.py    (offline: built-in qwen3_coder / hermes /
+#   10. test-tool-parser.py    (offline: built-in qwen3_coder / hermes /
 #                              llama3_json tool-call parsers +
 #                              tokenization/mapping.json entries; bundled
 #                              tokenizer when transformers is installed)
-#   10. test-sampling-overrides.py (offline e2e: the sampling-override layers
+#   11. test-sampling-overrides.py (offline e2e: the sampling-override layers
 #                              — config parsing, the five-layer precedence,
 #                              GET/PUT /sampling_overrides auth + 501s, a
 #                              pushed policy shaping the next completion)
-#   11. test-contract.py      (live: both engines' wire contract, no proxy)
-#   12. test-relay.py / test-worker.py / test-direct.py on vllm and sglang,
+#   12. test-tokenizer-fingerprint.py (offline: the tokenizer-identity
+#                              fingerprint — cross-repo corpus pin, algorithm
+#                              sensitivity, registry caching, GET
+#                              /tokenizer_fingerprint + 404/501s, and the
+#                              recorded pins of the bundled Qwen3.5 tokenizer;
+#                              the bundle section skips without transformers)
+#   13. test-contract.py      (live: both engines' wire contract, no proxy)
+#   14. test-relay.py / test-worker.py / test-direct.py on vllm and sglang,
 #      then test-slime.py     (live e2e: 50 agents x 2 turns each)
 #
 # Live tests get one automatic retry: the shared engine endpoints flake
@@ -44,7 +56,7 @@
 #
 # Usage:
 #   bash test/test_all.sh              # everything (needs live endpoints)
-#   bash test/test_all.sh --offline    # stages 1-8 only, no endpoints needed
+#   bash test/test_all.sh --offline    # stages 1-12 only, no endpoints needed
 #
 # Environment:
 #   PYTHON           interpreter to use (default: ../venv/bin/python next to
@@ -130,16 +142,18 @@ EOF
 }
 
 echo "== offline =="
-run "py-compile"         0 "$PYTHON" -m py_compile proxyserver/*.py test/*.py
-run "engines"            0 "$PYTHON" test/test-engines.py
-run "token-stream"       0 env TOKENIZER_MODEL="$TOKENIZER_MODEL" "$PYTHON" test/test-token-stream.py
-run "profiles"           0 "$PYTHON" test/test-profiles.py
-run "recorder"           0 "$PYTHON" test/test-recorder.py
-run "routed-experts"     0 "$PYTHON" test/test-routed-experts.py
-run "relay-recovery"     0 "$PYTHON" test/test-relay-recovery.py
-run "multi-agent"        0 "$PYTHON" test/test-multi-agent.py
-run "tool-parser"        0 "$PYTHON" test/test-tool-parser.py
-run "sampling-overrides" 0 "$PYTHON" test/test-sampling-overrides.py
+run "py-compile"            0 "$PYTHON" -m py_compile proxyserver/*.py test/*.py
+run "engines"               0 "$PYTHON" test/test-engines.py
+run "sglang-transport"      0 "$PYTHON" test/test-sglang-transport.py
+run "token-stream"          0 env TOKENIZER_MODEL="$TOKENIZER_MODEL" "$PYTHON" test/test-token-stream.py
+run "profiles"              0 "$PYTHON" test/test-profiles.py
+run "recorder"              0 "$PYTHON" test/test-recorder.py
+run "routed-experts"        0 "$PYTHON" test/test-routed-experts.py
+run "relay-recovery"        0 "$PYTHON" test/test-relay-recovery.py
+run "multi-agent"           0 "$PYTHON" test/test-multi-agent.py
+run "tool-parser"           0 "$PYTHON" test/test-tool-parser.py
+run "sampling-overrides"    0 "$PYTHON" test/test-sampling-overrides.py
+run "tokenizer-fingerprint" 0 "$PYTHON" test/test-tokenizer-fingerprint.py
 
 if [ "$OFFLINE_ONLY" -eq 1 ]; then
     echo; echo "== summary (offline only) =="

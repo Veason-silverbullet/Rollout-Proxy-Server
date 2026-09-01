@@ -257,6 +257,20 @@ class BaseRolloutProvider:
         }
 
     # ------------------------------------------------------------------
+    # Tokenizer identity (training–rollout consistency)
+    # ------------------------------------------------------------------
+
+    def tokenizer_fingerprint(self, model_name: str) -> dict[str, Any]:
+        """The serving tokenizer's identity fingerprint for ``model_name``
+        (``GET /tokenizer_fingerprint``): computed on the runtime tokenizer
+        via the model registry, cached per profile.  Raises
+        :class:`~proxyserver.model_registry.UnknownModelError` for an
+        unmapped name.  Synchronous and CPU-bound on first call (it hashes
+        the full vocab) — the HTTP layer threads it off the event loop.
+        """
+        return self.models.fingerprint_payload(model_name)
+
+    # ------------------------------------------------------------------
     # Deterministic engine rejections (fail-fast on exact retries)
     # ------------------------------------------------------------------
 
