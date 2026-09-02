@@ -33,7 +33,7 @@ context_length: 262144
 # enable_return_routed_experts — slime sets that server arg from the same flag,
 # so keep the two in step: flag on with capture off crashes the trainer's first
 # step, capture on against engines without the server arg fails the first turn.
-return_routed_experts: false
+return_routed_experts: true
 save_rollout_routed_experts: false
 
 
