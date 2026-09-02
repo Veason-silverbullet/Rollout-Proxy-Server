@@ -326,6 +326,39 @@ def test_routed_experts_latest_supersedes() -> None:
           rec.dump_session("s")["routed_experts"]["a"]["rows"] == len(P2) + len(C2) - 1)
 
 
+def test_routed_experts_delta_append() -> None:
+    print("\nA delta blob is appended to the stored capture; a stale one is dropped")
+    import base64
+
+    def rows_blob(rows: int, start: int, fill: int) -> dict:
+        return {"data": base64.b64encode(bytes([fill]) * (rows * 6)).decode("ascii"),
+                "rows": rows, "cols": 6, "dtype": "uint8", "start": start}
+
+    rec = SessionRecorder()
+    rec.ensure_session("s", model_name="m")
+    r1 = len(P1) + len(C1) - 1                      # turn 1: whole stream, start 0
+    rec.record_completion("s", [U1], "hello", C1, [-0.1, -0.2],
+                          finish_reason="stop", prompt_token_ids=P1, agent_id="a",
+                          routed_experts=rows_blob(r1, 0, 1))
+    r2 = len(P2) + len(C2) - 1 - r1                 # turn 2: only the rows since
+    rec.record_completion("s", [U1, A1, U2], "t2", C2, [-0.3, -0.4, -0.5],
+                          finish_reason="stop", prompt_token_ids=P2, agent_id="a",
+                          routed_experts=rows_blob(r2, r1, 2))
+    stored = rec.dump_session("s")["routed_experts"]["a"]
+    data = base64.b64decode(stored["data"])
+    check("the delta was appended: rows cover the whole stream",
+          stored["rows"] == len(P2) + len(C2) - 1 and stored["start"] == 0)
+    check("bytes are turn 1's rows followed by turn 2's",
+          data == bytes([1]) * (r1 * 6) + bytes([2]) * (r2 * 6))
+
+    # A late delivery of turn 2's delta (start no longer matches): dropped.
+    rec.record_completion("s", [U1, A1, U2], "t2", C2, [-0.3, -0.4, -0.5],
+                          finish_reason="stop", prompt_token_ids=P2, agent_id="a",
+                          routed_experts=rows_blob(r2, r1, 9))
+    check("a stale delta cannot corrupt the stored coverage",
+          base64.b64decode(rec.dump_session("s")["routed_experts"]["a"]["data"]) == data)
+
+
 def test_routed_experts_snapshot_gating() -> None:
     print("\nBlobs stay out of the disk snapshots unless asked for")
     # The store rewrites the full session JSON after every turn; a blob
@@ -376,6 +409,7 @@ def main() -> None:
     test_weight_version_recorded_per_turn()
     test_deleted_session_tombstone()
     test_routed_experts_latest_supersedes()
+    test_routed_experts_delta_append()
     test_routed_experts_snapshot_gating()
     print("\n" + "=" * 70)
     print("PASS: SessionRecorder stores turns delta-only and records a turn\n"

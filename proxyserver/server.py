@@ -716,11 +716,16 @@ def make_local_completion_handler(provider: Any):
         # sticky endpoint, turn lock) on what it calls a session id; hand it
         # the composed stream id so each agent owns an independent stream.
         stream = stream_id(session_id, agent_id)
+        # Rows/cols of the routed-experts blob already recorded for this
+        # stream, so the engine returns only this turn's delta (R3).
+        session_record = proxy.recorder.get_session(session_id)
+        prior_blob = session_record.routed_experts.get(agent_id) if session_record else None
         try:
             prompt_ids, token_ids, log_probs, finish_reason, completion_text, engine_meta = (
                 await provider.generate(
                     messages=messages,
                     session_id=stream,
+                    routed_experts_prior=(prior_blob.rows, prior_blob.cols) if prior_blob else None,
                     model=model,
                     temperature=_sampling_param(body, "temperature"),
                     top_p=_sampling_param(body, "top_p"),

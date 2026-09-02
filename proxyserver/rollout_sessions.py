@@ -123,15 +123,18 @@ class RoutedExpertsBlob(BaseModel):
     """Per-token MoE expert selections for one agent's whole token stream.
 
     Produced by the slime transport when routed-experts capture is on (R3,
-    slime's ``--use-rollout-routing-replay``): the engine reports the
-    selections for the **entire stream so far** on every turn, so one blob
-    covers the agent's full stream minus one and each turn's blob supersedes
-    the previous — the record never stores per-turn deltas (which would be
-    quadratic, every delta carrying the whole prefix again).
+    slime's ``--use-rollout-routing-replay``).  On the wire a turn's blob is
+    either the **entire stream so far** (``start == 0``, the first turn or
+    a fresh capture) or the rows added since the recorder's stored blob
+    (``start == rows already stored``, requested with
+    ``routed_experts_start_len``); the recorder appends deltas, so the
+    stored blob always covers the agent's full stream minus one with
+    ``start == 0`` — one blob per agent, never per turn.
     """
 
     data: str = Field(description="base64 of a C-order uint8 array of rows × cols expert ids")
-    rows: int = Field(description="Tokens covered = the agent's stream length - 1")
+    rows: int = Field(description="Tokens covered; stored: the agent's stream length - 1")
+    start: int = Field(default=0, description="Row offset within the agent's stream; 0 once stored")
     cols: int = Field(
         description=(
             "Expert selections per token = num_layers × topk of the served "

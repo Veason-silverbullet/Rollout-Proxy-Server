@@ -1,6 +1,7 @@
 """Thread-safe session data recorder for the LLM proxy."""
 
 from __future__ import annotations
+import base64
 import json
 import logging
 import threading
@@ -223,13 +224,15 @@ class SessionRecorder:
         re-create a record nobody will ever fetch or delete again.
 
         ``routed_experts`` is the turn's repacked capture blob (see
-        :class:`~proxyserver.rollout_sessions.RoutedExpertsBlob`).  It
-        covers the agent's whole stream up to this turn, so it is stored
-        **per agent, latest wins** — never per turn — and only forward: a
-        late delivery whose coverage is shorter than what is stored (an
-        orphaned turn racing a newer one) cannot shrink it.  A duplicate
-        delivery early-returns above without touching it, which is
-        harmless — its blob is identical to the stored one.
+        :class:`~proxyserver.rollout_sessions.RoutedExpertsBlob`), stored
+        **per agent** — never per turn — and only forward.  A delta
+        (``start`` = the rows already stored, same ``cols``, on a turn that
+        extends the stream) is appended; a whole-stream blob (``start`` 0)
+        supersedes when it is at least as wide as what is stored; anything
+        else — a late delivery of an older turn racing a newer one, a delta
+        against a stream that was reset — is dropped with a warning rather
+        than corrupting the stored coverage.  A duplicate delivery
+        early-returns above without touching it.
         """
         full_prompt_ids = list(prompt_token_ids or [])
         with self._lock:
@@ -325,8 +328,25 @@ class SessionRecorder:
             if routed_experts is not None and agent_id is not None:
                 blob = RoutedExpertsBlob.model_validate(routed_experts)
                 prev = session.routed_experts.get(agent_id)
-                if prev is None or blob.rows >= prev.rows:
+                if (
+                    blob.start and prev is not None and blob.start == prev.rows
+                    and blob.cols == prev.cols and not new_conversation
+                ):
+                    merged = base64.b64decode(prev.data) + base64.b64decode(blob.data)
+                    session.routed_experts[agent_id] = RoutedExpertsBlob(
+                        data=base64.b64encode(merged).decode("ascii"),
+                        rows=prev.rows + blob.rows, cols=prev.cols, dtype=prev.dtype,
+                    )
+                elif blob.start == 0 and (prev is None or blob.rows >= prev.rows):
                     session.routed_experts[agent_id] = blob
+                else:
+                    logger.warning(
+                        "Session %s (agent %s): dropping a routed-experts blob that "
+                        "neither extends nor supersedes the stored one (start %d, "
+                        "rows %d, cols %d vs stored rows %s, cols %s)",
+                        session_id, agent_id, blob.start, blob.rows, blob.cols,
+                        prev.rows if prev else None, prev.cols if prev else None,
+                    )
             record = CompletionRecord(
                 agent_id=agent_id,
                 request_messages=messages,

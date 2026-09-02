@@ -369,6 +369,7 @@ class BaseRolloutProvider:
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         session_id: str | None,
+        routed_experts_prior: tuple[int, int] | None = None,
     ) -> tuple[list[int], list[float], str | None, dict[str, Any]]:
         """Run one generation on the framework's rollout servers.
 
@@ -412,6 +413,7 @@ class BaseRolloutProvider:
         repetition_penalty: float | None = None,
         presence_penalty: float | None = None,
         frequency_penalty: float | None = None,
+        routed_experts_prior: tuple[int, int] | None = None,
     ) -> tuple[list[int], list[int], list[float], str, str, dict[str, Any]]:
         """Tokenize, call the rollout engine, return raw results.
 
@@ -540,8 +542,12 @@ class BaseRolloutProvider:
             )
 
             try:
+                # The prior rides along only when there is one, so transport
+                # hooks that predate it (tests, third-party providers) keep
+                # their three-argument signature.
                 token_ids, log_probs, stop_reason, engine_meta = await self._call_engine(
                     prompt_ids, sampling_params, session_id,
+                    **({"routed_experts_prior": routed_experts_prior} if routed_experts_prior else {}),
                 )
             except Exception as e:
                 self._note_engine_rejection(session_id, messages, e)
@@ -719,6 +725,7 @@ class RayRolloutProvider(BaseRolloutProvider):
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         session_id: str | None,
+        routed_experts_prior: tuple[int, int] | None = None,
     ) -> tuple[list[int], list[float], str | None, dict[str, Any]]:
         # Sticky on session_id so multi-turn requests in the same trial reuse
         # the same engine replica (preserves prefix cache). The per-call
@@ -768,6 +775,7 @@ async def _sglang_generate(
     sampling_params: dict[str, Any],
     session_id: str | None,
     return_routed_experts: bool = False,
+    routed_experts_prior: tuple[int, int] | None = None,
 ) -> tuple[list[int], list[float], str | None, dict[str, Any]]:
     """One generation in SGLang's native ``/generate`` dialect.
 
@@ -786,6 +794,10 @@ async def _sglang_generate(
     MoE expert selections (the same request key slime's own rollout sends for
     ``--use-rollout-routing-replay``); the repacked payload rides the returned
     meta as ``routed_experts`` — see :func:`_pack_routed_experts`.
+    ``routed_experts_prior`` is ``(rows, cols)`` of the blob the recorder
+    already holds for this stream: when set, the request carries
+    ``routed_experts_start_len=rows`` so the engine returns only the rows
+    added since — a turn's delta instead of the whole prefix again.
 
     ``session_id`` is the composed stream id (one per agent of a rollout); it
     rides along as the router's routing key so every turn of a stream lands on
@@ -803,6 +815,8 @@ async def _sglang_generate(
     }
     if return_routed_experts:
         body["return_routed_experts"] = True
+        if routed_experts_prior and routed_experts_prior[0] > 0:
+            body["routed_experts_start_len"] = routed_experts_prior[0]
     resp = await http.post(
         "/generate",
         json=body,
@@ -838,6 +852,7 @@ async def _sglang_generate(
         # same >100 MB payload the parse above did.
         meta["routed_experts"] = await asyncio.to_thread(
             _pack_routed_experts, meta_info, len(prompt_ids), len(token_ids), session_id,
+            routed_experts_prior,
         )
 
     if not return_logprob:
@@ -894,18 +909,28 @@ def _pack_routed_experts(
     prompt_len: int,
     completion_len: int,
     session_id: str | None,
+    prior: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     """SGLang's ``meta_info["routed_experts"]``, repacked for the record.
 
     The engine (``enable_return_routed_experts``) reports the per-token MoE
     expert selections as base64 of a little-endian int32 C-order array of
-    logical shape ``(stream_so_far - 1, num_layers * topk)`` — the **whole**
-    stream up to and including this turn, prompt included, so each turn's
-    payload supersedes the previous one and the recorder keeps only the
-    latest per agent.  Expert ids are tiny (< num_experts, 256 on current
-    models), so int32 is 4x air: the record keeps uint8.  ``cols`` stays a
-    single number because the proxy holds no model config — the trainer-side
-    consumer, which knows ``num_layers`` × ``topk``, validates and reshapes.
+    logical shape ``(rows, num_layers * topk)``.  Without a start offset the
+    rows cover the **whole** stream up to and including this turn, prompt
+    included (``stream_so_far - 1``: a token's routing exists once it has
+    been fed as input).  With ``prior = (rows, cols)`` of the blob the
+    recorder already holds, the request asked for
+    ``routed_experts_start_len=rows`` and the engine returns only
+    ``[rows, stream - 1)`` — the turn's delta, which the recorder appends
+    (see ``SessionRecorder.record``); ``start`` in the returned blob says
+    which one this is.  An engine that predates the request key, or a router
+    that strips it, still answers with the full range: that case is
+    recognised from ``prior``'s column count and sliced down here, so
+    capture keeps working and only the bandwidth saving is lost.  Expert ids
+    are tiny (< num_experts, 256 on current models), so int32 is 4x air: the
+    record keeps uint8.  ``cols`` stays a single number because the proxy
+    holds no model config — the trainer-side consumer, which knows
+    ``num_layers`` × ``topk``, validates and reshapes.
 
     A missing or misaligned payload is refused (``EngineError``) rather than
     recorded, like the logprob guard in :func:`_sglang_generate`: a silently
@@ -923,12 +948,21 @@ def _pack_routed_experts(
             f"--use-rollout-routing-replay)?"
         )
     values = np.frombuffer(base64.b64decode(encoded), dtype="<i4")
-    rows = prompt_len + completion_len - 1
-    if rows <= 0 or values.size == 0 or values.size % rows != 0:
+    full_rows = prompt_len + completion_len - 1
+    start, cols_hint = prior or (0, None)
+    rows = full_rows - start
+    if start and cols_hint and values.size == full_rows * cols_hint:
+        # The engine ignored routed_experts_start_len and sent the whole
+        # stream: keep the delta the recorder expects.
+        values = values[-rows * cols_hint:]
+    if rows <= 0 or values.size == 0 or values.size % rows != 0 or (
+        cols_hint and values.size // rows != cols_hint
+    ):
         raise EngineError(
             f"Session {session_id}: routed_experts payload does not line up with "
             f"the stream ({values.size} values for {rows} rows = prompt "
-            f"{prompt_len} + completion {completion_len} - 1)"
+            f"{prompt_len} + completion {completion_len} - 1 - start {start}"
+            f"{f', expected {cols_hint} cols' if cols_hint else ''})"
         )
     if values.min() < 0 or values.max() > 255:
         raise EngineError(
@@ -940,6 +974,7 @@ def _pack_routed_experts(
         "rows": rows,
         "cols": values.size // rows,
         "dtype": "uint8",
+        "start": start,
     }
 
 
@@ -1219,6 +1254,7 @@ class SlimeRolloutProvider(BaseRolloutProvider):
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         session_id: str | None,
+        routed_experts_prior: tuple[int, int] | None = None,
     ) -> tuple[list[int], list[float], str | None, dict[str, Any]]:
         # Window learned lazily from the router (_engine_context_length); the
         # clamp itself is shared with the direct transport's paths.
@@ -1229,6 +1265,7 @@ class SlimeRolloutProvider(BaseRolloutProvider):
         return await _sglang_generate(
             self._http, prompt_ids, sampling_params, session_id,
             return_routed_experts=self.get_routed_experts_config()["effective"],
+            routed_experts_prior=routed_experts_prior,
         )
 
     async def aclose(self) -> None:
@@ -1452,6 +1489,7 @@ class DirectRolloutProvider(BaseRolloutProvider):
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         session_id: str | None,
+        routed_experts_prior: tuple[int, int] | None = None,
     ) -> tuple[list[int], list[float], str | None, dict[str, Any]]:
         index = self._acquire_endpoint(session_id)
         http = self._clients[index]

@@ -145,12 +145,53 @@ def test_provider_capture_layers() -> None:
         raise AssertionError("FAIL: non-bool toggle accepted")
 
 
+def test_pack_delta_and_full_range_fallback() -> None:
+    print("\nA delta request packs only the new rows; a full-range answer is sliced")
+    # Stream: 5 prompt + 2 completion tokens -> 6 rows in total; the recorder
+    # already holds 4 rows x 6 cols, so this turn's delta is rows 4..6.
+    full = [(i * 37) % 256 for i in range(6 * 6)]
+    delta = full[4 * 6:]
+
+    blob = _pack_routed_experts(sglang_meta(delta), 5, 2, "s", prior=(4, 6))
+    check("rows = prompt + completion - 1 - start", blob["rows"] == 2 and blob["start"] == 4)
+    check("the delta's ids are packed as-is",
+          np.frombuffer(base64.b64decode(blob["data"]), dtype=np.uint8).tolist() == delta)
+
+    blob = _pack_routed_experts(sglang_meta(full), 5, 2, "s", prior=(4, 6))
+    check("an engine that ignored start_len is sliced down to the delta",
+          blob["rows"] == 2 and blob["start"] == 4
+          and np.frombuffer(base64.b64decode(blob["data"]), dtype=np.uint8).tolist() == delta)
+
+    blob = _pack_routed_experts(sglang_meta(full), 5, 2, "s")
+    check("no prior: the whole stream, start 0", blob["rows"] == 6 and blob["start"] == 0)
+
+    try:
+        _pack_routed_experts(sglang_meta([1] * 10), 5, 2, "s", prior=(4, 6))
+    except EngineError as e:
+        check("a delta with the wrong column count is refused", "expected 6 cols" in str(e))
+    else:
+        raise AssertionError("FAIL: mismatched delta did not raise")
+
+    output = {"output_ids": [900, 901], "meta_info": {**sglang_meta(delta), "finish_reason": {"type": "stop"}}}
+    http = _FakeHttp(output)
+    _, _, _, meta = asyncio.run(_sglang_generate(
+        http, [1, 2, 3, 4, 5], {"max_tokens": 8}, "s",
+        return_routed_experts=True, routed_experts_prior=(4, 6)))
+    check("the request carries routed_experts_start_len = stored rows",
+          http.bodies[0].get("routed_experts_start_len") == 4)
+    check("and the meta carries the delta blob", meta["routed_experts"]["rows"] == 2)
+    http = _FakeHttp({"output_ids": [900, 901], "meta_info": {**sglang_meta(full), "finish_reason": {"type": "stop"}}})
+    asyncio.run(_sglang_generate(http, [1, 2, 3, 4, 5], {"max_tokens": 8}, "s", return_routed_experts=True))
+    check("no prior sends no start_len", "routed_experts_start_len" not in http.bodies[0])
+
+
 def main() -> None:
     print("=" * 70)
     print("Routed-experts capture (R3): pack, wire, layers")
     print("=" * 70)
     test_pack_round_trip()
     test_pack_refusals()
+    test_pack_delta_and_full_range_fallback()
     test_generate_carries_the_flag_and_the_blob()
     test_provider_capture_layers()
     print("\n" + "=" * 70)
