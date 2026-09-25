@@ -1,0 +1,302 @@
+"""Offline test of the routed-experts capture path (R3).
+
+What this pins, engine wire to record blob:
+
+* ``_pack_routed_experts`` — SGLang's base64 int32 meta (the format slime's
+  own ``decode_int32_meta_array`` reads) repacked to the uint8 record blob,
+  and every refusal: a missing payload (engines launched without
+  ``enable_return_routed_experts``), a misaligned element count, and ids
+  that do not fit uint8.  A refused payload must never be recorded — a
+  silently short tensor crashes the trainer's replay pass hours later.
+* ``_sglang_generate`` — ``return_routed_experts`` rides the ``/generate``
+  body only when asked, and the packed blob rides the returned engine meta.
+* ``SlimeRolloutProvider`` — the capture layers (config baseline, runtime
+  toggle, effective) behind ``GET/PUT /routed_experts``.
+* The local completion handler + recorder — a new conversation on an agent
+  stream requests a fresh whole-stream capture and replaces the stored blob,
+  never offsetting it by (or appending to) the previous conversation's rows.
+
+Run:
+    python test/test-routed-experts.py
+"""
+
+from __future__ import annotations
+import asyncio
+import base64
+import sys
+from pathlib import Path
+from typing import Any
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from proxyserver.engines import EngineError  # noqa: E402
+from proxyserver.rollout_provider import (  # noqa: E402
+    BaseRolloutProvider,
+    SlimeRolloutProvider,
+    _pack_routed_experts,
+    _sglang_generate,
+)
+from proxyserver.server import LLMProxyServer, make_local_completion_handler  # noqa: E402
+from offline_common import FakeTokenizer, check  # noqa: E402
+
+
+def sglang_meta(values: list[int]) -> dict[str, Any]:
+    """meta_info as the engine sends it: base64 of little-endian int32."""
+    return {"routed_experts": base64.b64encode(np.asarray(values, dtype="<i4").tobytes()).decode("ascii")}
+
+
+def test_pack_round_trip() -> None:
+    print("int32 engine payload -> uint8 record blob, losslessly")
+    # 3 prompt + 2 completion tokens -> 4 rows; 6 selections per token.
+    values = [(i * 37) % 256 for i in range(4 * 6)]
+    blob = _pack_routed_experts(sglang_meta(values), 3, 2, "s")
+
+    check("rows = prompt + completion - 1", blob["rows"] == 4)
+    check("cols is inferred from the element count", blob["cols"] == 6)
+    check("dtype says uint8", blob["dtype"] == "uint8")
+    unpacked = np.frombuffer(base64.b64decode(blob["data"]), dtype=np.uint8)
+    check("every expert id survives the repack", unpacked.tolist() == values)
+    check("the blob is 4x smaller than the wire payload",
+          len(base64.b64decode(blob["data"])) * 4
+          == len(base64.b64decode(sglang_meta(values)["routed_experts"])))
+
+
+def test_pack_refusals() -> None:
+    print("\nA payload that cannot be replayed is refused, not recorded")
+    for label, meta, prompt_len, completion_len, needle in (
+        ("a missing payload names the engine flag",
+         {}, 3, 2, "enable_return_routed_experts"),
+        ("an element count that does not divide the rows is refused",
+         sglang_meta([1] * 23), 3, 2, "does not line up"),
+        ("an id over 255 cannot be packed as uint8",
+         sglang_meta([0] * 23 + [256]), 3, 2, "uint8"),
+        ("a negative id is refused too",
+         sglang_meta([-1] + [0] * 23), 3, 2, "uint8"),
+    ):
+        try:
+            _pack_routed_experts(meta, prompt_len, completion_len, "s")
+        except EngineError as e:
+            check(label, needle in str(e))
+        else:
+            raise AssertionError(f"FAIL: {label}: no EngineError raised")
+
+
+class _FakeResponse:
+    def __init__(self, output: dict[str, Any]):
+        self._output = output
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self) -> dict[str, Any]:
+        return self._output
+
+
+class _FakeHttp:
+    """Records the POST body and returns a scripted /generate response."""
+
+    def __init__(self, output: dict[str, Any]):
+        self._output = output
+        self.bodies: list[dict[str, Any]] = []
+
+    async def post(self, url: str, json: dict[str, Any], headers=None) -> _FakeResponse:
+        self.bodies.append(json)
+        return _FakeResponse(self._output)
+
+
+def test_generate_carries_the_flag_and_the_blob() -> None:
+    print("\n/generate asks for routed experts only when capture is on")
+    values = list(range(4 * 6))
+    output = {"output_ids": [900, 901], "meta_info": {**sglang_meta(values), "finish_reason": {"type": "stop"}}}
+
+    http = _FakeHttp(output)
+    _, _, _, meta = asyncio.run(_sglang_generate(
+        http, [1, 2, 3], {"max_tokens": 8}, "s", return_routed_experts=True))
+    check("the request body carries return_routed_experts",
+          http.bodies[0].get("return_routed_experts") is True)
+    check("the packed blob rides the engine meta",
+          meta["routed_experts"]["rows"] == 4 and meta["routed_experts"]["dtype"] == "uint8")
+
+    http = _FakeHttp({"output_ids": [900, 901], "meta_info": {"finish_reason": {"type": "stop"}}})
+    _, _, _, meta = asyncio.run(_sglang_generate(http, [1, 2, 3], {"max_tokens": 8}, "s"))
+    check("capture off sends no request key", "return_routed_experts" not in http.bodies[0])
+    check("and attaches no meta", "routed_experts" not in meta)
+
+    http = _FakeHttp({"output_ids": [900, 901], "meta_info": {"finish_reason": {"type": "stop"}}})
+    try:
+        asyncio.run(_sglang_generate(http, [1, 2, 3], {"max_tokens": 8}, "s", return_routed_experts=True))
+    except EngineError as e:
+        check("capture on against engines without the server flag fails the first turn",
+              "enable_return_routed_experts" in str(e))
+    else:
+        raise AssertionError("FAIL: missing routed_experts did not raise")
+
+
+def test_provider_capture_layers() -> None:
+    print("\nThe capture layers behind GET/PUT /routed_experts")
+    provider = SlimeRolloutProvider("http://127.0.0.1:1", return_routed_experts=True)
+    check("the config baseline is effective by itself",
+          provider.get_routed_experts_config() == {"config": True, "runtime": None, "effective": True})
+    check("the runtime layer wins while set",
+          provider.set_runtime_routed_experts(False)["effective"] is False)
+    check("clearing the layer falls back to the config",
+          provider.set_runtime_routed_experts(None)["effective"] is True)
+    try:
+        provider.set_runtime_routed_experts("yes")  # type: ignore[arg-type]
+    except ValueError:
+        check("a non-bool toggle is refused", True)
+    else:
+        raise AssertionError("FAIL: non-bool toggle accepted")
+
+
+def test_pack_delta_and_full_range_fallback() -> None:
+    print("\nA delta request packs only the new rows; a full-range answer is sliced")
+    # Stream: 5 prompt + 2 completion tokens -> 6 rows in total; the recorder
+    # already holds 4 rows x 6 cols, so this turn's delta is rows 4..6.
+    full = [(i * 37) % 256 for i in range(6 * 6)]
+    delta = full[4 * 6:]
+
+    blob = _pack_routed_experts(sglang_meta(delta), 5, 2, "s", prior=(4, 6))
+    check("rows = prompt + completion - 1 - start", blob["rows"] == 2 and blob["start"] == 4)
+    check("the delta's ids are packed as-is",
+          np.frombuffer(base64.b64decode(blob["data"]), dtype=np.uint8).tolist() == delta)
+
+    blob = _pack_routed_experts(sglang_meta(full), 5, 2, "s", prior=(4, 6))
+    check("an engine that ignored start_len is sliced down to the delta",
+          blob["rows"] == 2 and blob["start"] == 4
+          and np.frombuffer(base64.b64decode(blob["data"]), dtype=np.uint8).tolist() == delta)
+
+    blob = _pack_routed_experts(sglang_meta(full), 5, 2, "s")
+    check("no prior: the whole stream, start 0", blob["rows"] == 6 and blob["start"] == 0)
+
+    try:
+        _pack_routed_experts(sglang_meta([1] * 10), 5, 2, "s", prior=(4, 6))
+    except EngineError as e:
+        check("a delta with the wrong column count is refused", "expected 6 cols" in str(e))
+    else:
+        raise AssertionError("FAIL: mismatched delta did not raise")
+
+    output = {"output_ids": [900, 901], "meta_info": {**sglang_meta(delta), "finish_reason": {"type": "stop"}}}
+    http = _FakeHttp(output)
+    _, _, _, meta = asyncio.run(_sglang_generate(
+        http, [1, 2, 3, 4, 5], {"max_tokens": 8}, "s",
+        return_routed_experts=True, routed_experts_prior=(4, 6)))
+    check("the request carries routed_experts_start_len = stored rows",
+          http.bodies[0].get("routed_experts_start_len") == 4)
+    check("and the meta carries the delta blob", meta["routed_experts"]["rows"] == 2)
+    http = _FakeHttp({"output_ids": [900, 901], "meta_info": {**sglang_meta(full), "finish_reason": {"type": "stop"}}})
+    asyncio.run(_sglang_generate(http, [1, 2, 3, 4, 5], {"max_tokens": 8}, "s", return_routed_experts=True))
+    check("no prior sends no start_len", "routed_experts_start_len" not in http.bodies[0])
+
+
+class _RoutingEngineProvider(BaseRolloutProvider):
+    """Real strict-TITO provider over a fake SGLang engine with R3 capture.
+
+    The engine's routing row for stream position ``i`` is derived from the
+    token at ``i``, so a recorded blob can be checked row by row against the
+    stream it claims to cover.  Like SGLang, it honors
+    ``routed_experts_start_len`` by returning only rows ``[start, len - 1)``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(tokenizer_loader=lambda path: FakeTokenizer())
+        self.next_tokens = [900, 901, 902]
+        self.priors: list[tuple[int, int] | None] = []
+        self.last_stream: list[int] = []
+
+    async def _call_engine(self, prompt_ids, sampling_params, session_id, routed_experts_prior=None):
+        self.priors.append(routed_experts_prior)
+        tokens = list(self.next_tokens)
+        self.last_stream = list(prompt_ids) + tokens
+        start = routed_experts_prior[0] if routed_experts_prior else 0
+        values = [v for t in self.last_stream[:-1] for v in routing_row(t)][start * 2:]
+        meta = {"routed_experts": _pack_routed_experts(
+            sglang_meta(values), len(prompt_ids), len(tokens), session_id, routed_experts_prior)}
+        return tokens, [-0.1] * len(tokens), "stop", meta
+
+
+def routing_row(token: int) -> list[int]:
+    """The fake engine's expert selections for one token (2 cols)."""
+    return [token % 256, (token // 256) % 256]
+
+
+def test_new_conversation_resets_capture() -> None:
+    print("\nA new conversation on the same agent stream starts a fresh capture")
+    # Regression: the local handler used to pass the stored blob as the prior
+    # even when the request opened a new conversation.  A longer new
+    # conversation then recorded a blob whose leading rows came from the old
+    # conversation (row count right, content wrong); a shorter one failed the
+    # turn outright.
+    provider = _RoutingEngineProvider()
+    handler = make_local_completion_handler(provider)
+    proxy = LLMProxyServer(completion_handler=handler, api_key="k", save_rollout_sessions=False)
+    model = "Qwen3.5-9B"
+
+    async def turn(messages: list[dict[str, Any]]) -> int:
+        proxy.recorder.ensure_session("s", model_name=model)
+        response = await handler(proxy, "s", "a", model, messages, {"model": model, "max_tokens": 32}, False)
+        return response.status_code
+
+    def stored_rows() -> list[list[int]]:
+        session = proxy.recorder.get_session("s")
+        assert session is not None
+        b = session.routed_experts["a"]
+        flat = np.frombuffer(base64.b64decode(b.data), dtype=np.uint8)
+        return flat.reshape(b.rows, b.cols).tolist()
+
+    def covers_last_stream() -> bool:
+        return stored_rows() == [routing_row(t) for t in provider.last_stream[:-1]]
+
+    def user(text: str) -> dict[str, Any]:
+        return {"role": "user", "content": text}
+
+    async def scenario() -> None:
+        # Conversation 1: two turns, the second appends a delta.
+        c1 = [user("c1")]
+        check("conversation 1 opens", await turn(c1) == 200 and provider.priors[-1] is None)
+        c1 += [{"role": "assistant", "content": "a1"}, user("c1 more")]
+        check("its continuation requests a delta", await turn(c1) == 200 and provider.priors[-1] is not None)
+        check("the stored blob covers conversation 1's stream", covers_last_stream())
+
+        # Conversation 2: an opener longer than conversation 1's stream.
+        provider.next_tokens = [700, 701, 702]
+        c2 = [user(f"c2-{i}") for i in range(40)]
+        check("a longer new conversation succeeds", await turn(c2) == 200)
+        check("its opener requests the whole stream (no stale prior)", provider.priors[-1] is None)
+        check("its capture replaces conversation 1's", covers_last_stream())
+        c2 += [{"role": "assistant", "content": "a2"}, user("c2 more")]
+        check("its continuation succeeds", await turn(c2) == 200)
+        check("every stored row belongs to conversation 2's stream", covers_last_stream())
+
+        # Conversation 3: an opener far shorter than the stored blob.
+        provider.next_tokens = [500, 501, 502]
+        check("a shorter new conversation succeeds instead of failing the turn",
+              await turn([user("c3")]) == 200)
+        check("its narrower capture replaces the wider stored one", covers_last_stream())
+
+    asyncio.run(scenario())
+
+
+def main() -> None:
+    print("=" * 70)
+    print("Routed-experts capture (R3): pack, wire, layers")
+    print("=" * 70)
+    test_pack_round_trip()
+    test_pack_refusals()
+    test_pack_delta_and_full_range_fallback()
+    test_generate_carries_the_flag_and_the_blob()
+    test_provider_capture_layers()
+    test_new_conversation_resets_capture()
+    print("\n" + "=" * 70)
+    print("PASS: the engine's int32 routed-experts meta repacks losslessly to\n"
+          "      the uint8 record blob; misaligned, out-of-range, or missing\n"
+          "      payloads are refused before anything is recorded; /generate\n"
+          "      carries the request flag only while capture is effective; and\n"
+          "      the provider's config/runtime layers behave like the\n"
+          "      sampling-override layers they mirror.")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
