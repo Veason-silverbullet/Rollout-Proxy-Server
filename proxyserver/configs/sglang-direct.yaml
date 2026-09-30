@@ -1,0 +1,26 @@
+inference_engine: sglang
+transport_mode: direct
+
+
+host: 0.0.0.0
+port: 9400
+proxy_api_delimiter: "-"
+save_rollout_sessions: true
+rollout_session_dir: sessions
+save_rollout_logprobs: true
+log_dir: logs
+
+
+# transport_mode: direct — the proxy transports tokens with vLLM/SGLang inference engines directly
+#   inference_engine_base_url:  list of OpenAI base url to vLLM/SGLang inference engines
+#   inference_engine_api_key:  list of OpenAI api key to vLLM/SGLang inference engines
+#                              (one per base url, or a single key broadcast to all)
+inference_engine_base_url: [""]
+inference_engine_api_key: [""]
+
+
+# Training-side sampling policy that WINS OVER agent-request params
+# (distribution keys only -- temperature, top_p, top_k, min_p, *_penalty;
+# max_tokens/stop stay request-owned), e.g.:
+# sampling_overrides:
+#   temperature: 1.0

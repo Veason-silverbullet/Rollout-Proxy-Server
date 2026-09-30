@@ -1,0 +1,19 @@
+inference_engine: vllm
+transport_mode: verl
+
+host: 0.0.0.0
+port: 9400
+proxy_api_delimiter: "-"
+save_rollout_sessions: true
+rollout_session_dir: sessions
+save_rollout_logprobs: true
+log_dir: logs
+
+# Existing trainer-owned Ray cluster and named load-balancer actor.
+# Set the name/namespace here or with CLI flags.
+ray_address: auto
+ray_namespace: null
+verl_load_balancer: null
+
+# sampling_overrides:
+#   temperature: 1.0
