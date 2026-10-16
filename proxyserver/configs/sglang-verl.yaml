@@ -1,0 +1,25 @@
+inference_engine: sglang
+transport_mode: verl
+
+host: 0.0.0.0
+port: 9400
+proxy_api_delimiter: "-"
+save_rollout_sessions: true
+rollout_session_dir: sessions
+save_rollout_logprobs: true
+save_rollout_sampling_masks: false
+log_dir: logs
+
+# HTTP server hosted by a VeRL rollout actor, or the deployment's HTTP router.
+# Use the server root (http://host:port), without /v1.
+router_url: null
+router_api_key: null
+context_length: null  # Match VeRL's rollout.max_model_len.
+return_routed_experts: false
+save_rollout_routed_experts: false
+
+# Match the trainer's sampling policy. For vLLM with top_p < 1, enable
+# return_sampling_mask at engine startup; otherwise pin top_p to 1.0.
+# sampling_overrides:
+#   temperature: 1.0
+#   top_p: 1.0

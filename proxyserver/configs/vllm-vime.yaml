@@ -1,0 +1,42 @@
+inference_engine: vllm
+transport_mode: vime
+
+
+host: 0.0.0.0
+port: 9400
+proxy_api_delimiter: "-"
+save_rollout_sessions: true
+rollout_session_dir: sessions
+save_rollout_logprobs: true
+save_rollout_sampling_masks: false
+log_dir: logs
+
+
+# transport_mode: vime — the proxy generates through vime's vllm-router.
+#   router_url:      http://{vllm_router_ip}:{vllm_router_port}
+#   router_api_key:  optional bearer token for the router
+#   context_length:  match the engines' --vllm-max-model-len
+# Agents select the tokenizer and tool parser through their request's model.
+# Point this URL at the policy model's router; it already selects the engine.
+router_url: null
+router_api_key: null
+context_length: null
+
+
+# R3 (vime's --use-rollout-routing-replay): requires vime's patched vLLM
+# engines with routing replay enabled. Captures use the same stored uint8
+# format as slime; expert IDs must fit [0, 256).
+return_routed_experts: false
+save_rollout_routed_experts: false
+
+
+# Training-side sampling policy that WINS OVER agent-request params.
+# Full precedence: runtime push > sampling_overrides > request > generation_config.json.
+# top_p < 1 automatically requests and records the sampling masks needed by
+# vime's trainer. Enable return_sampling_mask at engine startup. Pin these values
+# to the trainer's policy; do not rely on a model's generation defaults.
+# sampling_overrides:
+#   temperature: 1.0
+#   top_p: 1.0
+#   top_k: -1
+#   min_p: 0.0
