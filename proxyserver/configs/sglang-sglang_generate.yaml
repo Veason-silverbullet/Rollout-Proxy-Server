@@ -1,0 +1,30 @@
+inference_engine: sglang
+transport_mode: sglang_generate
+
+host: 0.0.0.0
+port: 9400
+proxy_api_delimiter: "|"
+save_rollout_sessions: true
+rollout_session_dir: sessions
+save_rollout_logprobs: true
+save_rollout_sampling_masks: false
+log_dir: logs
+
+# Server root speaking SGLang /generate (Slime router, VeRL server, etc.).
+# Agents select the tokenizer and tool parser through their request's model.
+router_url: null
+router_api_key: null
+# Training deployment default: match the actual engine window. This explicit
+# value bypasses /get_server_info discovery. Null permits discovery; an unknown
+# window disables clamping.
+context_length: 262144
+
+# Training deployment default: engine and trainer must support routing replay.
+# Set false (or use --no-return-routed-experts) when replay is not configured.
+return_routed_experts: true
+save_rollout_routed_experts: false
+
+# Training policy: runtime push > sampling_overrides > request > generation_config.json.
+# sampling_overrides:
+#   temperature: 1.0
+#   top_p: 1.0

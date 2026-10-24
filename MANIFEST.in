@@ -1,0 +1,3 @@
+include test/README.md test/test_all.sh
+recursive-include test *.py
+recursive-include sandbox *.py *.md

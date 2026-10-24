@@ -1,0 +1,542 @@
+"""Per-model profiles: strict TITO beyond ChatML, stated not inferred.
+
+Each model family is described by a ``ModelProfile`` in a module under
+``proxyserver/tokenization/`` that *states* its strict-TITO chat markers
+(generation prompt, assistant turn end), its tool-call parser, and its
+reasoning format — so a new family is served by a ``mapping.json`` entry
+pointing at a small profile module, with no change to the shared core.
+``mapping.json`` maps each served model name to a profile.
+
+The load-bearing check is :func:`test_profile_stream_matches_template`: driving
+``TokenStreamManager`` with the markers a profile *states*, the incrementally
+built stream must be byte-identical to the model's own chat-template render —
+for ChatML (Qwen) and Llama alike.  The implicit per-render prefix a template
+prepends (Llama's bos + dated default system block) is measured and stripped
+(:meth:`TokenStreamManager._measure_implicit_prefix`).
+"""
+
+from __future__ import annotations
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from offline_common import check, load_real_tokenizer
+from proxyserver.model_registry import ModelRegistry, TOKENIZATION_DIR
+from proxyserver.token_stream import TokenStreamManager, as_token_ids
+from proxyserver.tokenization.base import NoReasoning, ThinkReasoning, get_profile
+from proxyserver.tokenization.tool_parser import GLMToolParser, Llama3JsonToolParser, Qwen3CoderToolParser
+
+_TOKENIZATION = TOKENIZATION_DIR
+
+
+def test_profiles_load() -> None:
+    print("\nProfiles load with stated markers, parser, and reasoning")
+    qwen = get_profile("qwen3_5")
+    check("qwen3_5 states ChatML markers",
+          (qwen.generation_prompt, qwen.assistant_turn_end) == ("<|im_start|>assistant\n", "<|im_end|>\n"))
+    check("qwen3_5 tokenizer dir / parser / reasoning",
+          qwen.tokenizer_dir == "Qwen3.5" and qwen.tool_call_parser is Qwen3CoderToolParser
+          and isinstance(qwen.reasoning, ThinkReasoning))
+    qwen36 = get_profile("qwen3_6")
+    check("qwen3_6 mirrors Qwen3.5 markers with its own tokenizer",
+          (qwen36.generation_prompt, qwen36.assistant_turn_end)
+          == (qwen.generation_prompt, qwen.assistant_turn_end)
+          and qwen36.tokenizer_dir == "Qwen3.6"
+          and qwen36.tool_call_parser is Qwen3CoderToolParser
+          and isinstance(qwen36.reasoning, ThinkReasoning))
+    qwen38 = get_profile("qwen3_8")
+    check("qwen3_8 mirrors Qwen3.5 markers with its own tokenizer",
+          (qwen38.generation_prompt, qwen38.assistant_turn_end)
+          == (qwen.generation_prompt, qwen.assistant_turn_end)
+          and qwen38.tokenizer_dir == "Qwen3.8"
+          and qwen38.tool_call_parser is Qwen3CoderToolParser
+          and isinstance(qwen38.reasoning, ThinkReasoning))
+    llama = get_profile("llama3_1")
+    check("llama3_1 states Llama markers",
+          (llama.generation_prompt, llama.assistant_turn_end)
+          == ("<|start_header_id|>assistant<|end_header_id|>\n\n", "<|eot_id|>"))
+    check("llama3_1 tokenizer dir / parser / reasoning",
+          llama.tokenizer_dir == "Llama-3.1" and llama.tool_call_parser is Llama3JsonToolParser
+          and isinstance(llama.reasoning, NoReasoning))
+    try:
+        get_profile("no_such_profile")
+        check("bad profile name raises", False)
+    except ValueError:
+        check("bad profile name raises loudly (not a silent default)", True)
+
+
+def test_reasoning_parsers() -> None:
+    print("\nReasoning parsers own the <think> logic (one place, not scattered)")
+    samples = ["<think>r</think>c", "r</think>c", "<think>\n\n</think>\n\nok",
+               "plain content", "<think>a</think>x<think>b</think>y", "<think>truncated"]
+    think = ThinkReasoning()
+    expected = ["c", "c", "ok", "plain content", "xy", ""]
+    check("ThinkReasoning.strip removes closed and incomplete reasoning",
+          [think.strip(s) for s in samples] == expected)
+    for text, content in (
+        ("before<think>reasoning</think>after", "beforeafter"),
+        ("before<think>one</think>middle<think>two</think>after", "beforemiddleafter"),
+        ("before<think>closed</think>after<think>unfinished", "beforeafter"),
+        ("prefilled</think>\n\nbefore<think>later</think>after", "beforeafter"),
+        (" \n<think>leading</think>\nanswer", "answer"),
+    ):
+        check(f"ThinkReasoning preserves visible content: {text!r}", think.strip(text) == content)
+    check("mid-answer reasoning extraction excludes visible prefix",
+          think.extract("before<think>reasoning</think>after") == "reasoning")
+    check("ThinkReasoning.extract pulls the leading think block",
+          think.extract("<think>reasoning</think>answer") == "reasoning")
+    check("ThinkReasoning.extract is None without a closed block", think.extract("<think>truncated") is None)
+    check("ThinkReasoning.extract is None for an empty block", think.extract("<think>\n\n</think>\n\nx") is None)
+    none = NoReasoning()
+    check("NoReasoning strips nothing / extracts nothing",
+          all(none.strip(s) == s and none.extract(s) is None for s in samples))
+    glm = get_profile("glm5_3").reasoning
+    check("GLM retains ordinary closed and truncated reasoning behavior",
+          [glm.strip(s) for s in samples] == expected)
+    call = "<tool_call>ping</tool_call>"
+    for text, content, reasoning in (
+        ("<think>plan" + call, call, "plan"),
+        ("before<think>plan" + call, "before" + call, "plan"),
+        ("<think> </think>" + call, call, None),
+        ("<think>truncated", "", None),
+        ("before" + call, "before" + call, None),
+        ("<think>one" + call + "<think>two" + call, call + call, "one"),
+    ):
+        check(f"GLM reasoning boundaries: {text!r}",
+              glm.strip(text) == content and glm.extract(text) == reasoning)
+    check("Qwen still treats tools inside unclosed reasoning as reasoning",
+          think.strip("<think>plan" + call) == ""
+          and think.extract("<think>plan" + call) is None)
+    literal_call = "<tool_call>write<arg_key>content</arg_key><arg_value><think>literal</think></arg_value></tool_call>"
+    for prefix, reasoning in (("", None), ("<think>plan", "plan"), ("<think>plan</think>", "plan")):
+        check("GLM preserves reasoning markup inside tool bodies",
+              glm.strip(prefix + literal_call) == literal_call
+              and glm.extract(prefix + literal_call) == reasoning)
+    check("GLM resumes reasoning handling after a tool body",
+          glm.strip(literal_call + "<think>next</think>answer") == literal_call + "answer"
+          and glm.extract(literal_call + "<think>next</think>answer") == "next")
+    partial_call = "<tool_call>write<arg_key>content</arg_key><arg_value><think>literal</think>"
+    check("GLM preserves reasoning markup in incomplete tool bodies",
+          glm.strip("<think>plan" + partial_call) == partial_call
+          and glm.extract(partial_call) is None)
+
+
+def test_integration_helpers_use_profiles() -> None:
+    print("\nIntegration helpers use each model's markers and reasoning format")
+    # Import the live-test helpers with dummy endpoints and no fixture-file
+    # dependency. These checks never contact an inference engine.
+    is_file = Path.is_file
+    with patch.dict(os.environ, {
+        "INFERENCE_ENGINE": "vllm", "OPENAI_BASE_URL": "http://unused.invalid/v1",
+        "OPENAI_API_KEY": "test", "MODEL_NAME": "Qwen3.5-4B",
+    }), patch.object(Path, "is_file", lambda p: False if p.name == "test_engines.yaml" else is_file(p)):
+        import common
+
+    class LiteralTokenizer:
+        def encode(self, text, **kwargs):
+            return list(text.encode())
+
+        def decode(self, ids, **kwargs):
+            return bytes(ids).decode()
+
+    tokenizer = LiteralTokenizer()
+    with patch.object(common, "load_bundled_tokenizer", return_value=tokenizer):
+        for model, header, ending, gap, content in (
+            ("Qwen3.5-4B", "<|im_start|>assistant\n", "<|im_end|>\n", "\n", "answer"),
+            ("Llama-3.1-8B-Instruct", "<|start_header_id|>assistant<|end_header_id|>\n\n",
+             "<|eot_id|>", "", "<think>literal</think>answer"),
+        ):
+            verifier = common.make_verifier(model)
+            check(f"{model}: verifier uses the stated header and ending",
+                  (verifier.generation_prompt, verifier.assistant_turn_end) == (header, ending))
+            check(f"{model}: independent generation-header expectation",
+                  common._expected_generation_prompt(verifier) == tokenizer.encode(header))
+            check(f"{model}: natural stop supplies only the missing suffix",
+                  common._expected_turn_gap(verifier, tokenizer.encode("answer" + ending.rstrip("\n"))) == tokenizer.encode(gap))
+            check(f"{model}: truncated completion supplies the entire ending",
+                  common._expected_turn_gap(verifier, tokenizer.encode("answer")) == tokenizer.encode(ending))
+            check(f"{model}: agent content respects the reasoning dialect",
+                  common.expected_agent_content(model, tokenizer.encode("<think>literal</think>answer")) == content)
+
+
+def test_response_carries_reasoning_content() -> None:
+    print("\nThe OpenAI response surfaces reasoning_content per the pinned model's profile")
+    from proxyserver.server import build_openai_response, build_openai_stream_response
+    from proxyserver.token_stream import ParsedCompletion
+    registry = ModelRegistry()
+
+    def message(model: str, completion_text: str, **kw):
+        bundle = registry.resolve(model)
+        ids = bundle.tokenizer.encode(completion_text, add_special_tokens=False)
+        decoded = asyncio.run(bundle.tool_parser.extract_completion(ids, completion_text=completion_text))
+        parsed = ParsedCompletion(decoded.content, kw.get("tool_calls"), kw.get("finish_reason", "stop"),
+                                  decoded.reasoning_content)
+        # Formatting must depend only on the parsed result, never re-resolve
+        # the profile or interpret the sampled tokens.
+        with patch("proxyserver.server.resolve_profile", side_effect=AssertionError("formatter resolved a model")):
+            body = build_openai_response(token_ids=ids, parsed=parsed, model=model)
+        return body, body["choices"][0]["message"]
+
+    _, msg = message("Qwen3.5-9B", "<think>weighing it</think>answer")
+    check("a <think> model's assistant turn carries reasoning_content",
+          msg["reasoning_content"] == "weighing it" and msg["content"] == "answer")
+    _, msg = message("Qwen3.5-9B", "answer")
+    check("no thinking block -> no reasoning_content field", "reasoning_content" not in msg)
+    _, msg = message("Llama-3.1-8B-Instruct", "<think>x</think>answer")
+    check("a no-reasoning model never carries it", "reasoning_content" not in msg)
+    body = build_openai_response(token_ids=[1], model="mystery-model",
+                                 parsed=ParsedCompletion("answer", None, "stop", "already parsed"))
+    check("formatting an already parsed result needs no model mapping",
+          body["choices"][0]["message"]["reasoning_content"] == "already parsed")
+
+    tc = [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]
+    for content in (None, "", " \n "):
+        parsed = ParsedCompletion(content, tc, "tool_calls", "plan")
+        body = build_openai_response(token_ids=[1], parsed=parsed, model="Qwen3.5-9B")
+        check("tool-only results retain null message content, including framework nulls",
+              body["choices"][0]["message"] == {
+                  "role": "assistant", "content": None, "tool_calls": tc, "reasoning_content": "plan",
+              })
+    body, msg = message("Qwen3.5-9B", "<think>pick f</think><tool_call>...</tool_call>",
+                        tool_calls=tc, finish_reason="tool_calls")
+    check("a tool-call turn carries it alongside tool_calls",
+          msg["reasoning_content"] == "pick f" and msg["tool_calls"] == tc)
+    _, msg = message("GLM-5.3-Flash", "<think>pick f<tool_call>f</tool_call>",
+                     tool_calls=tc, finish_reason="tool_calls")
+    check("GLM responses extract reasoning implicitly ended by a tool call",
+          msg["reasoning_content"] == "pick f" and msg["tool_calls"] == tc)
+
+    async def sse_events(resp):
+        return [e async for e in resp.body_iterator]
+
+    events = asyncio.run(sse_events(build_openai_stream_response(body)))
+    first_delta = json.loads(events[0].removeprefix("data: "))["choices"][0]["delta"]
+    check("the streaming delta mirrors reasoning_content",
+          first_delta["reasoning_content"] == "pick f")
+
+
+def test_registry_wires_the_profile() -> None:
+    print("\nModelRegistry builds a bundle straight from the profile")
+    reg = ModelRegistry()
+    qwen = reg.resolve("Qwen3.5-9B")
+    check("qwen bundle carries the profile's ChatML markers",
+          (qwen.token_streams.generation_prompt, qwen.token_streams.assistant_turn_end)
+          == ("<|im_start|>assistant\n", "<|im_end|>\n"))
+    check("qwen bundle: qwen3_coder parser + <think> reasoning",
+          isinstance(qwen.tool_parser, Qwen3CoderToolParser) and isinstance(qwen.reasoning, ThinkReasoning))
+    llama = reg.resolve("Llama-3.1-8B-Instruct")
+    check("llama bundle carries the profile's Llama markers",
+          (llama.token_streams.generation_prompt, llama.token_streams.assistant_turn_end)
+          == ("<|start_header_id|>assistant<|end_header_id|>\n\n", "<|eot_id|>"))
+    check("all Qwen3.5-* names share one bundle", reg.resolve("Qwen3.5-27B") is qwen)
+    qwen36 = reg.resolve("Qwen3.6-27B")
+    check("Qwen3.6 has a separate tokenizer bundle and Qwen tool parser",
+          qwen36 is not qwen and qwen36.tokenizer is not qwen.tokenizer
+          and isinstance(qwen36.tool_parser, Qwen3CoderToolParser))
+    check("all Qwen3.6-* names share one bundle", reg.resolve("Qwen3.6-35B-A3B") is qwen36)
+    check("Qwen3.6 loads its bundled sampling defaults",
+          qwen36.sampling_defaults == {"temperature": 1.0, "top_k": 20, "top_p": 0.95})
+    completion = '<think>plan</think><tool_call><function=f><parameter=x>1</parameter></function></tool_call><|im_end|>'
+    ids = qwen36.tokenizer.encode(completion, add_special_tokens=False)
+    content, calls = asyncio.run(qwen36.tool_parser.extract_tool_calls(ids))
+    check("Qwen3.6 real tokens decode into tools with reasoning and special tokens removed",
+          content == "" and len(calls) == 1 and calls[0].name == "f"
+          and json.loads(calls[0].arguments) == {"x": 1})
+    payload = reg.fingerprint_payload("Qwen3.6-27B")
+    check("Qwen3.6 fingerprint resolves its own profile", payload["profile"] == "qwen3_6"
+          and bool(payload["fingerprint"]) and bool(payload["template_pin"]))
+    qwen38 = reg.resolve("Qwen3.8-27B")
+    check("Qwen3.8-Flash-Next shares the verified Qwen3.8 bundle",
+          reg.resolve("Qwen3.8-Flash-Next") is qwen38)
+    check("Qwen3.8 has a separate tokenizer bundle and Qwen tool parser",
+          qwen38 is not qwen and qwen38.tokenizer is not qwen.tokenizer
+          and isinstance(qwen38.tool_parser, Qwen3CoderToolParser))
+    check("Qwen3.8 loads its bundled sampling defaults",
+          qwen38.sampling_defaults == {"temperature": 1.0, "top_k": 20, "top_p": 0.95})
+    ids = qwen38.tokenizer.encode(completion, add_special_tokens=False)
+    content, calls = asyncio.run(qwen38.tool_parser.extract_tool_calls(ids))
+    check("Qwen3.8 real tokens decode into tools with reasoning and special tokens removed",
+          content == "" and len(calls) == 1 and calls[0].name == "f"
+          and json.loads(calls[0].arguments) == {"x": 1})
+    payload = reg.fingerprint_payload("Qwen3.8-27B")
+    check("Qwen3.8 fingerprint resolves its own profile", payload["profile"] == "qwen3_8"
+          and bool(payload["fingerprint"]) and bool(payload["template_pin"]))
+
+
+def test_glm_profile() -> None:
+    registry = ModelRegistry()
+    bundle = registry.resolve("GLM-5.3-Flash")
+    check("GLM has its own parser and sampling defaults",
+          isinstance(bundle.tool_parser, GLMToolParser)
+          and bundle.sampling_defaults == {"temperature": 1.0, "top_p": 0.95})
+    tok, mgr = bundle.tokenizer, bundle.token_streams
+    check("all three engine stop IDs match the bundled vocabulary",
+          tok.convert_tokens_to_ids(["<|endoftext|>", "<|user|>", "<|observation|>"])
+          == [154820, 154827, 154829])
+    check("fixed GLM prefix measured for continuation stripping",
+          tok.decode(mgr._get_sys_ids()) == "[gMASK]<sop><|system|>Reasoning Effort: Max"
+          and mgr._sys_ids_measured)
+
+
+def test_implicit_prefix_measured() -> None:
+    print("\nThe implicit per-render prefix is measured for each profile")
+    qwen = load_real_tokenizer(str(_TOKENIZATION / "Qwen3.5"))
+    if qwen is not None:
+        m = TokenStreamManager(qwen)  # ChatML defaults
+        check("Qwen has no implicit render prefix", m._get_sys_ids() == [] and m._sys_ids_measured)
+    qwen36 = load_real_tokenizer(str(_TOKENIZATION / "Qwen3.6"))
+    if qwen36 is not None:
+        p = get_profile("qwen3_6")
+        m = TokenStreamManager(qwen36, generation_prompt=p.generation_prompt, assistant_turn_end=p.assistant_turn_end)
+        check("Qwen3.6 has no implicit render prefix", m._get_sys_ids() == [] and m._sys_ids_measured)
+    qwen38 = load_real_tokenizer(str(_TOKENIZATION / "Qwen3.8"))
+    if qwen38 is not None:
+        p = get_profile("qwen3_8")
+        m = TokenStreamManager(qwen38, generation_prompt=p.generation_prompt, assistant_turn_end=p.assistant_turn_end)
+        prefix = qwen38.decode(m._get_sys_ids(), skip_special_tokens=False)
+        check("Qwen3.8's reasoning-effort system prefix is measured",
+              m._sys_ids_measured and prefix.startswith("<|im_start|>system\n")
+              and "Reasoning effort is set to xhigh." in prefix
+              and prefix.endswith("<|im_end|>\n"))
+    llama = load_real_tokenizer(str(_TOKENIZATION / "Llama-3.1"))
+    if llama is not None:
+        p = get_profile("llama3_1")
+        m = TokenStreamManager(llama, generation_prompt=p.generation_prompt, assistant_turn_end=p.assistant_turn_end)
+        prefix = m._get_sys_ids()
+        decoded = llama.decode(prefix, skip_special_tokens=False) if prefix else ""
+        check("Llama's implicit prefix is measured (bos + a system block)",
+              len(prefix) > 0 and m._sys_ids_measured
+              and "<|begin_of_text|>" in decoded and "<|start_header_id|>system" in decoded)
+
+
+def _oracle(profile_name: str, tokenizer_dir_name: str) -> None:
+    """Byte-identity oracle: a stream built with the profile's *stated* markers
+    must equal the template's own render, turn after turn."""
+    tok = load_real_tokenizer(str(_TOKENIZATION / tokenizer_dir_name))
+    if tok is None:
+        return
+    profile = get_profile(profile_name)
+    gen_prompt = profile.generation_prompt
+    eos = profile.assistant_turn_end.rstrip("\n")  # the engine samples the EOS, not a trailing newline
+
+    def render(messages: list[dict]) -> list[int]:
+        return as_token_ids(
+            tok.apply_chat_template(messages, add_generation_prompt=False, tokenize=True),
+            what="oracle render",
+        ) + tok.encode(gen_prompt, add_special_tokens=False)
+
+    def sampled(text: str, *, truncated: bool = False) -> list[int]:
+        return tok.encode(text if truncated else text + eos, add_special_tokens=False)
+
+    # The Qwen template *rewrites* assistant history by what follows it: before
+    # a tool result it keeps (and injects an empty) <think> block, before a
+    # user message it strips one.  So the tool-result reply must already carry
+    # the empty block a think-model's template renders there — otherwise the
+    # sampled tokens and the template's render differ and the oracle is invalid.
+    # A no-reasoning model (Llama) has no such rewriting.
+    think = "<think>\n\n</think>\n\n" if isinstance(profile.reasoning, ThinkReasoning) else ""
+    convo = [{"role": "system", "content": "You are helpful."},
+             {"role": "user", "content": "weather in SF? 你好 🎉"}]
+    for label, reply, follow_up, truncated in (
+        ("user follow-up", "Let me check.", {"role": "user", "content": "and tomorrow?"}, False),
+        ("tool result", think + "Calling the tool.", {"role": "tool", "content": "sunny, 21C", "tool_call_id": "c1"}, False),
+        ("truncated turn", "Let me che", {"role": "user", "content": "go on"}, True),
+    ):
+        # Qwen3.8 always renders an empty think block for these assistant
+        # messages and reads reasoning_content separately from content.
+        if profile_name == "qwen3_8" and not reply.startswith(think):
+            reply = think + reply
+        mgr = TokenStreamManager(tok, generation_prompt=gen_prompt, assistant_turn_end=profile.assistant_turn_end)
+        messages = list(convo)
+        prompt = mgr.build_prompt(label, messages)
+        check(f"[{profile_name}/{label}] opening prompt matches the template", prompt == render(messages))
+        completion = sampled(reply, truncated=truncated)
+        mgr.commit(label, messages, prompt, completion, log_probs=[0.0] * len(completion),
+                   finish_reason="length" if truncated else "stop")
+        for turn in (2, 3):
+            assistant_content = reply.removeprefix(think) if profile_name == "qwen3_8" else reply
+            messages = messages + [{"role": "assistant", "content": assistant_content}, dict(follow_up)]
+            expected = render(messages)
+            check(f"[{profile_name}/{label}] turn-{turn-1} sampled reply renders verbatim (valid oracle)",
+                  tok.decode(expected, skip_special_tokens=False).count(reply) == turn - 1)
+            prompt = mgr.build_prompt(label, messages)
+            check(f"[{profile_name}/{label}] turn-{turn} prompt matches the template", prompt == expected)
+            completion = sampled(reply)
+            mgr.commit(label, messages, prompt, completion, log_probs=[0.0] * len(completion), finish_reason="stop")
+
+
+def test_profile_stream_matches_template() -> None:
+    print("\nBuilt streams are byte-identical to the template's own render (profile markers)")
+    _oracle("qwen3_5", "Qwen3.5")
+    _oracle("qwen3_6", "Qwen3.6")
+    _oracle("qwen3_8", "Qwen3.8")
+    _oracle("llama3_1", "Llama-3.1")
+
+
+def test_glm_stream_matches_template() -> None:
+    bundle = ModelRegistry().resolve("GLM-5.3-Flash")
+    tools = [{"type": "function", "function": {
+        "name": "lookup", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+    }}]
+    call_text = "<tool_call>lookup<arg_key>city</arg_key><arg_value>上海</arg_value></tool_call>"
+    tok, mgr = bundle.tokenizer, bundle.token_streams
+    encode = lambda text: tok.encode(text, add_special_tokens=False)
+
+    def render(messages, template=None):
+        return as_token_ids(tok.apply_chat_template(
+            messages, tools=tools, tokenize=True, add_generation_prompt=False,
+            **({"chat_template": template} if template else {}),
+        ), what="GLM oracle") + encode("<|assistant|>")
+
+    opening = [{"role": "system", "content": "Be helpful."}, {"role": "user", "content": "上海 weather?"}]
+    call = {"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": {"city": "上海"}}}
+    for label, reply, assistant, followup in (
+        ("user", "<think>plan</think>answer<|user|>",
+         {"role": "assistant", "reasoning_content": "plan", "content": "answer"},
+         [{"role": "user", "content": "and tomorrow?"}]),
+        ("tool", "<think>plan</think>" + call_text + "<|observation|>",
+         {"role": "assistant", "reasoning_content": "plan", "content": "", "tool_calls": [call]},
+         [{"role": "tool", "tool_call_id": "c1", "content": "sunny"}]),
+        ("truncation", "<think>plan</think>ans",
+         {"role": "assistant", "reasoning_content": "plan", "content": "ans"},
+         [{"role": "user", "content": "continue"}]),
+    ):
+        messages = list(opening)
+        prompt = mgr.build_prompt(label, messages, tools=tools)
+        check(f"{label}: opening matches full template", prompt == render(messages))
+        for turn in range(2):
+            completion = encode(reply)
+            mgr.commit(label, messages, prompt, completion, log_probs=[-0.1] * len(completion), finish_reason="stop", tools=tools)
+            messages += [assistant, *followup]
+            next_prompt = mgr.build_prompt(label, messages, tools=tools)
+            check(f"{label} turn {turn + 2}: full-template agreement and exact sampled prefix",
+                  next_prompt == render(messages) and next_prompt[:len(prompt + completion)] == prompt + completion)
+            prompt = next_prompt
+
+    # Reversed parallel results must retain the same order with or without
+    # the preceding assistant in the render (the delta cannot see it).
+    second = {**call, "id": "c2"}
+    assistant = {"role": "assistant", "reasoning_content": "plan", "content": "", "tool_calls": [call, second]}
+    messages = list(opening)
+    prompt = mgr.build_prompt("parallel", messages, tools=tools)
+    completion = encode("<think>plan</think>" + call_text * 2 + "<|observation|>")
+    mgr.commit("parallel", messages, prompt, completion, tools=tools)
+    messages += [assistant, {"role": "tool", "tool_call_id": "c2", "content": "second"},
+                 {"role": "tool", "tool_call_id": "c1", "content": "first"}]
+    built = mgr.build_prompt("parallel", messages, tools=tools)
+    check("reordered parallel tool results match full serving template", built == render(messages))
+    legacy = (Path(get_profile("glm5_3").tokenizer_path) / "chat_template-legacy.jinja").read_text()
+    check("upstream sorting difference is explicit", render(messages, legacy) != built)
+
+
+def test_glm_developer_instructions() -> None:
+    from copy import deepcopy
+    from proxyserver.request_validation import validate_chat_request
+    from proxyserver.token_stream import normalize_messages
+
+    bundle = ModelRegistry().resolve("GLM-5.3-Flash")
+    tok, mgr = bundle.tokenizer, bundle.token_streams
+    encode = lambda text: tok.encode(text, add_special_tokens=False)
+    marker = "Preserve developer policy."
+    user = {"role": "user", "content": "Hello"}
+    developer = {"role": "developer", "content": marker}
+    openings = [
+        [developer, user],
+        [{"role": "system", "content": "Be helpful."}, developer, user],
+        [user, developer],
+        [{"role": "developer", "content": [
+            {"type": "text", "text": marker}, {"type": "text", "text": "保持指令"},
+        ]}, user],
+    ]
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+
+    def render(messages, request_tools):
+        normalized = normalize_messages(messages)
+        equivalent = [{**m, "role": "system" if m["role"] == "developer" else m["role"]} for m in normalized]
+        return as_token_ids(tok.apply_chat_template(
+            equivalent, tools=request_tools, tokenize=True, add_generation_prompt=False,
+        ), what="GLM system-role control") + encode("<|assistant|>")
+
+    for index, opening in enumerate(openings):
+        for with_tools in (False, True):
+            messages = deepcopy(opening)
+            request_tools = tools if with_tools else None
+            sid = f"developer-{index}-{with_tools}"
+            validate_chat_request({"model": "GLM-5.3-Flash", "messages": messages, "tools": request_tools})
+            prompt = mgr.build_prompt(sid, messages, tools=request_tools)
+            assert prompt == render(messages, request_tools), "GLM discarded or changed developer instructions"
+            assert marker in tok.decode(prompt, skip_special_tokens=False)
+            assert messages == opening
+            completion = encode("<think>plan</think>answer<|user|>")
+            mgr.commit(sid, messages, prompt, completion, log_probs=[-0.1] * len(completion),
+                       finish_reason="stop", tools=request_tools)
+            assert mgr.cached_turn(sid, messages) is not None
+            messages += [{"role": "assistant", "reasoning_content": "plan", "content": "answer"},
+                         {"role": "user", "content": "Continue"}]
+            following = mgr.build_prompt(sid, messages, tools=request_tools)
+            assert following == render(messages, request_tools)
+            assert following[:len(prompt + completion)] == prompt + completion
+    check("GLM preserves developer instructions, retries, and exact continuation tokens with and without tools", True)
+
+
+def test_gpt_oss_profile() -> None:
+    registry = ModelRegistry()
+    profile = get_profile("gpt_oss")
+    model = "gpt-oss-20b"
+    opening = [{"role": "user", "content": "Look up the value"}]
+    tools = [{"type": "function", "function": {
+        "name": "lookup", "description": "Look up a value",
+        "parameters": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]},
+    }}]
+    bundle = registry.resolve(model)
+    tok = bundle.tokenizer
+    check("both gpt-oss model sizes share the bundle", registry.resolve("gpt-oss-120b") is bundle)
+    root = Path(profile.tokenizer_path)
+    for marker, token_id in {
+        "<|start|>": 200006, "<|message|>": 200008, "<|channel|>": 200005,
+        "<|end|>": 200007, "<|return|>": 200002, "<|call|>": 200012,
+    }.items():
+        check(f"{marker} has its upstream ID", tok.encode(marker, add_special_tokens=False) == [token_id])
+    config = json.loads((root / "generation_config.json").read_text())
+    check("action stops match generation config, excluding message boundaries",
+          list(profile.stop_token_ids) == config["eos_token_id"] and 200007 not in profile.stop_token_ids)
+    for messages, request_tools in ((opening, None), (opening, tools),
+                            ([{"role": "system", "content": "Be concise"}] + opening, tools),
+                            ([{"role": "developer", "content": "Be concise"}] + opening, None)):
+        prompt = bundle.token_streams.build_prompt("opening", messages, request_tools)
+        expected = as_token_ids(tok.apply_chat_template(messages, tools=request_tools, tokenize=True,
+                                                        add_generation_prompt=True), what="full template")
+        check("opening matches bundled full template", prompt == expected)
+    minimal = [{"type": "function", "function": {"name": "ping"}}]
+    check("tool descriptions are optional", bool(bundle.token_streams.build_prompt("minimal", opening, minimal)))
+
+
+def main() -> None:
+    test_profiles_load()
+    test_reasoning_parsers()
+    test_integration_helpers_use_profiles()
+    test_response_carries_reasoning_content()
+    test_registry_wires_the_profile()
+    test_glm_profile()
+    test_gpt_oss_profile()
+    test_implicit_prefix_measured()
+    test_profile_stream_matches_template()
+    test_glm_stream_matches_template()
+    test_glm_developer_instructions()
+    print("\n" + "=" * 70)
+    print("PASS: model profiles state each family's chat markers, tool-call\n"
+          "      parser, and reasoning format in one place; the registry builds\n"
+          "      a bundle straight from the profile; and streams built with a\n"
+          "      profile's stated markers are byte-identical to the template's\n"
+          "      own render — ChatML/Qwen and Llama alike.")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
