@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rollout-proxy-server"
+version = "0.5.0"
+description = "Strict token-in-token-out recording proxy for research rollouts"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.141.1",
+    "httpx==0.28.1",
+    "jinja2==3.1.6",
+    "numpy==2.5.3",
+    "pydantic==2.13.5",
+    "pyyaml==6.0.3",
+    "transformers==5.17.0",
+    "uvicorn==0.53.0",
+]
+
+[project.optional-dependencies]
+test = ["openai==2.54.0"]
+
+[project.scripts]
+rollout-proxy-server = "proxyserver.cli:main"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["proxyserver*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+proxyserver = [
+    "configs/*.yaml",
+    "tokenization/README.md",
+    "tokenization/mapping.json",
+    "tokenization/*/*.json",
+    "tokenization/*/*.jinja",
+    "tokenization/*/merges.txt",
+    "tokenization/*/LICENSE*",
+]

@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.vscode/
+.idea/
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+/.artifacts/
+/.rollout-proxy-server/
+/build/
+/dist/
+/test/test_engines.yaml
+/test/proxy/
+/proxyserver/logs/
+/proxyserver/sessions/
+proxyserver.out
